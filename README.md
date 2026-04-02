@@ -1,176 +1,250 @@
-# WorkBuddy Dispatcher
+# WorkBuddy Dispatcher V2
 
-通过 Chrome DevTools Protocol (CDP) 调度 WorkBuddy Agent，实现外部程序触发 Agent 任务并获取回复。
+通过 CDP 调度 WorkBuddy VS Code 扩展，实现多 Agent 会话协作编排。
 
-## 架构概览
+## 它能做什么
+
+| 能力 | 说明 |
+|------|------|
+| **会话管理** | 列出、切换、创建会话，读取消息，状态监控，截图 |
+| **消息收发** | 向任意会话发送消息，发送并等待回复，创建新会话发送首条消息 |
+| **跨会话通信** | 基于频道的内存消息总线，会话间松耦合信息传递 |
+| **任务链** | 多步骤顺序执行，步骤间自动传递上下文，支持 waitUntil 策略 |
+| **循环任务** | 多轮驱动 Agent 持续工作，自动检测停止关键词 |
+| **定时任务** | 延迟执行、定时重复 |
+| **Feature 管理** | 加载、选择、完成、失败追踪，支持分组和依赖 |
+| **异常自愈** | 诊断会话问题，自动或手动恢复 |
+| **Web 仪表盘** | 浏览器实时监控全局状态 |
+
+## 架构
 
 ```
-外部程序 → CDP WebSocket (port 9222) → WorkBuddy Electron → Agent Manager → LLM Agent
+外部程序/MCP Client
+    │
+    ▼ MCP (JSON-RPC) / REST API
+┌──────────────────────────────────────────────┐
+│           WorkBuddy Dispatcher V2             │
+│           (Node.js, port 5200)                │
+│                                               │
+│  ┌─────────────┐  ┌───────────┐              │
+│  │ SessionMgr  │  │ MessageBus│              │
+│  │ 会话生命周期 │  │ 频道消息  │              │
+│  └──────┬──────┘  └───────────┘              │
+│  ┌──────┴──────────────────────┐             │
+│  │     TaskOrchestrator        │             │
+│  │ TaskChain + Loop + Delayed  │             │
+│  └─────────────────────────────┘             │
+│  ┌─────────────┐  ┌─────────────┐            │
+│  │ FeatureMgr  │  │ Watcher+    │            │
+│  │ Feature管理 │  │ Healer      │            │
+│  └─────────────┘  └─────────────┘            │
+│                    │                           │
+│  ┌─────────────────┴──────────────┐          │
+│  │     CDP Client Layer           │          │
+│  │ CDPAgent + WorkbenchClient     │          │
+│  └─────────────────┬──────────────┘          │
+└────────────────────┼─────────────────────────┘
+                     │ CDP (port 9222)
+┌────────────────────┼─────────────────────────┐
+│          WorkBuddy VS Code Extension          │
+│  agentManager.html + workbench.html           │
+└───────────────────────────────────────────────┘
 ```
-
-WorkBuddy 基于 VS Code Electron，启动时可通过 `--remote-debugging-port=9222` 开启 CDP 调试端口。
 
 ## 快速开始
 
-### 启动 WorkBuddy（带 CDP）
+### 1. 启动 WorkBuddy（带 CDP）
 
 ```powershell
 A:\WorkBuddy\WorkBuddy.exe --remote-debugging-port=9222
 ```
 
-或使用快捷方式 `A:\WorkBuddy\WorkBuddy-CDP-9222.lnk`。
-
-### 验证连接
+### 2. 启动 Dispatcher
 
 ```bash
-node scripts/list_targets.js
+cd A:\GitHub\workbuddy-dispatcher
+npm install
+node mcp_server.js
 ```
 
-### 发送消息到 Agent
+启动后：
+- **MCP 端点**: `http://localhost:5200/mcp`
+- **REST API**: `http://localhost:5200/api/overview`
+- **Dashboard**: `http://localhost:5200/`
 
-```bash
-node scripts/send_message.js "你的消息"
-```
+### 3. 在 WorkBuddy 中接入
 
-## 核心发现
+在 WorkBuddy 的 MCP Server 配置中添加 Streamable HTTP 类型：
 
-### 1. CDP Target 结构
-
-WorkBuddy 启动后，CDP 会暴露多个 page target：
-
-| Target | 说明 |
-|--------|------|
-| `workbench.html` | 主编辑器 workbench |
-| `agentManager.html` | Agent Manager 页面（核心） |
-| `Claw - WorkBuddy` | Claw AI 专用页面 |
-| 各种 `vscode-webview://` | Webview iframe |
-
-**Agent Manager 页面**（`agentManager.html`）是调度入口，包含：
-- 侧边栏会话列表
-- 聊天输入框（Slate.js 编辑器）
-- 聊天消息区域
-
-### 2. 聊天输入框
-
-```html
-<div contenteditable="true" data-slate-editor data-slate-node
-     class="_editable_vx5q9_1" role="textbox"
-     placeholder="输入消息...">
-```
-
-- **编辑器**: Slate.js（React 组件）
-- **React 事件**: 通过 `__reactFiber$` 绑定，无 `onkeydown` HTML 属性
-- **发送**: Enter 键发送（Shift+Enter 换行）
-
-### 3. 输入方法
-
-**正确方式** — 使用 CDP `Input.dispatchKeyEvent`（只发 keyDown + keyUp，不发 char 事件）：
-
-```javascript
-// 逐字符输入（避免重复）
-for (const char of message) {
-  await cdpSend('Input.dispatchKeyEvent', {
-    type: 'keyDown', key: char, text: char,
-    code: `Key${char.toUpperCase()}`,
-    windowsVirtualKeyCode: char.charCodeAt(0),
-    nativeVirtualKeyCode: char.charCodeAt(0)
-  });
-  await cdpSend('Input.dispatchKeyEvent', {
-    type: 'keyUp', key: char,
-    code: `Key${char.toUpperCase()}`,
-    windowsVirtualKeyCode: char.charCodeAt(0),
-    nativeVirtualKeyCode: char.charCodeAt(0)
-  });
+```json
+{
+  "workbuddy-dispatcher": {
+    "transport": "streamable-http",
+    "url": "http://127.0.0.1:5200/mcp"
+  }
 }
-
-// Enter 发送
-await cdpSend('Input.dispatchKeyEvent', {
-  type: 'keyDown', key: 'Enter', code: 'Enter',
-  windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13
-});
-await cdpSend('Input.dispatchKeyEvent', {
-  type: 'keyUp', key: 'Enter', code: 'Enter',
-  windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13
-});
 ```
 
-**错误方式**:
-- ❌ 直接设置 `textContent` — 不触发 React 状态更新
-- ❌ 发送 `char` 类型事件 — Slate 会重复输入（"hello" → "hheelllloo"）
-- ❌ `document.execCommand('insertText')` — 不触发 Slate onChange
+接入后即可调用所有 `wb_*` 工具。
 
-### 4. IPC 通道
+## MCP 工具完整参考
 
-通过 workbench renderer 的 `window.vscode.ipcRenderer.invoke(channel)` 可调用：
+### 会话管理
 
-| 通道 | 返回 | 说明 |
-|------|------|------|
-| `codebuddy:getSessions` | `{sessions:[], total:0}` | WorkBuddy 会话列表 |
-| `codebuddy:getClawSessions` | `{sessions:[...], total:N}` | Claw 会话列表 |
-| `codebuddy:getSession` | 需要参数 | 获取单个会话（需 conversationId） |
-| `codebuddy:upsertSession` | undefined (成功) | 创建/更新会话 |
+| 工具 | 说明 |
+|------|------|
+| `wb_session_list` | 列出所有会话 |
+| `wb_session_get` | 获取会话详情 |
+| `wb_session_switch` | 切换到指定会话 |
+| `wb_session_create` | 创建新会话 |
+| `wb_session_messages` | 读取会话消息 |
+| `wb_session_status` | 获取会话状态 (idle/working) |
+| `wb_session_screenshot` | 截取当前会话截图 |
 
-**不可用的通道**（仅 extension 内部）：
-- `session/new` — "Unsupported event IPC channel"
-- `session/prompt` — 同上
-- `codebuddy:listSessions` — No handler
-- `codebuddy:chat.sessionList` — No handler
-- `codebuddy:chat.history` — No handler
-- `codebuddy:getMessages` — No handler
+### 消息
 
-### 5. DOM 消息结构
+| 工具 | 说明 |
+|------|------|
+| `wb_message_send` | 发送消息到会话 |
+| `wb_message_relay` | 发送消息并等待 Agent 回复 |
+| `wb_message_launch` | 创建新会话并发送首条消息 |
 
-Agent Manager 是**单页应用**，所有会话的 DOM 同时存在，通过 CSS 切换可见性：
+### 频道
+
+| 工具 | 说明 |
+|------|------|
+| `wb_channel_send` | 向频道发送消息 |
+| `wb_channel_read` | 从频道读取消息 |
+| `wb_channel_list` | 列出所有频道 |
+
+### 任务链
+
+| 工具 | 说明 |
+|------|------|
+| `wb_chain_create` | 创建多步骤任务链 |
+| `wb_chain_start` | 启动任务链（后台运行） |
+| `wb_chain_status` | 查看任务链状态 |
+| `wb_chain_cancel` | 取消任务链 |
+
+### 循环/定时任务
+
+| 工具 | 说明 |
+|------|------|
+| `wb_task_loop` | 创建循环任务 |
+| `wb_task_delayed` | 创建延迟/定时任务 |
+| `wb_task_start` | 启动任务 |
+| `wb_task_list` | 列出所有任务 |
+| `wb_task_cancel` | 取消任务 |
+| `wb_task_logs` | 查看任务日志 |
+
+### Feature 管理
+
+| 工具 | 说明 |
+|------|------|
+| `wb_feature_load` | 加载 feature_list.json |
+| `wb_feature_next` | 获取下一个可用 feature |
+| `wb_feature_complete` | 标记 feature 完成 |
+| `wb_feature_fail` | 标记 feature 失败 |
+| `wb_feature_stats` | Feature 统计 |
+
+### 系统
+
+| 工具 | 说明 |
+|------|------|
+| `wb_overview` | 全局概览 |
+| `wb_watcher_control` | 控制自动监控 |
+| `wb_heal_scan` | 扫描异常会话 |
+| `wb_heal_recover` | 恢复指定会话 |
+
+## 典型使用场景
+
+### 场景 1: 多步骤任务链
 
 ```
-agentManager.html
-├── conversation-sidebar
-│   ├── conversation-list-tabs (新建任务 / Claw / 专家 / 技能 / 自动化)
-│   └── conversation-list
-│       ├── conversation-item[data-id] "hello" ← CDP 测试创建
-│       └── conversation-item[data-id] ...
-├── chat-container (active)
-│   ├── [class*="userMessage"] ← 用户消息
-│   └── [class*="assistant"] ← Agent 回复
-│       ├── [class*="assistantMessageContent"]
-│       └── [class*="assistantTextContent"]
-└── 输入区域
-    ├── _mainArea_li9tf_41
-    ├── _content_li9tf_7
-    └── _container_li9tf_2
-        └── [contenteditable="true"] ← 输入框
+# 创建分析→设计→实现→测试的任务链
+wb_chain_create(
+  name="build-feature",
+  steps=[
+    { message: "分析需求文档 requirements.md，输出功能拆解", newSession: true },
+    { message: "根据分析结果设计技术方案", newSession: true },
+    { message: "实现核心功能模块", newSession: true },
+    { message: "编写单元测试", newSession: true }
+  ]
+)
+wb_chain_start(name="build-feature")
 ```
 
-### 6. 未解决的问题
+### 场景 2: 跨会话信息传递
 
-- **获取 Agent 回复**: agentManager DOM 里所有会话混合，无法精确区分哪个 `<div class="assistant">` 属于哪个会话
-- **会话切换**: 点击侧边栏后 React 状态异步更新，需要等待 + 轮询确认
-- **CDP 截图**: `Page.captureScreenshot` 偶尔超时（page 加载中时）
+```
+# 会话 A: 完成研究后发送结果
+wb_channel_send(channel="research", content="方案二更优，预计开发 3 天")
+
+# 会话 B: 读取研究结果
+wb_channel_read(channel="research")
+```
+
+### 场景 3: 循环任务驱动长文档编写
+
+```
+wb_task_loop(
+  name="write-docs",
+  initialMessage="请开始编写 API 文档第一章",
+  continueMessage="继续编写下一章",
+  maxRounds=8,
+  stopKeywords="文档完成,全部写完"
+)
+wb_task_start(name="write-docs")
+```
+
+### 场景 4: Feature 驱动的开发
+
+```
+wb_feature_load(filePath="features/feature_list.json")
+features = wb_feature_next()
+wb_message_send(message=f"请实现 feature {features[0].id}: {features[0].description}")
+# ... Agent 完成后 ...
+wb_feature_complete(featureIds=[features[0].id])
+wb_feature_stats()
+```
 
 ## 目录结构
 
 ```
 workbuddy-dispatcher/
-├── README.md              # 本文档
+├── mcp_server.js              # MCP Server + REST API + Dashboard 服务入口
+├── config.json                # 配置
+├── package.json
+├── dashboard.html             # Web 监控仪表盘
+├── lib/
+│   ├── cdp_client.js          # CDP 客户端 (CDPAgent + WorkbenchClient)
+│   ├── session_manager.js     # 会话管理
+│   ├── message_bus.js         # 频道消息总线
+│   ├── task_orchestrator.js   # 任务编排 (TaskChain + Loop + Delayed)
+│   ├── feature_manager.js     # Feature 管理
+│   └── watcher.js             # 异常检测 + 自动恢复
+├── scripts/                   # V1 独立脚本 (保留兼容)
+│   ├── send_message.js
+│   ├── read_messages.js
+│   ├── read_sessions.js
+│   └── list_targets.js
 ├── docs/
-│   ├── cdp-architecture.md    # CDP 架构详解
-│   ├── ipc-channels.md        # IPC 通道完整调查
-│   ├── exploration-log.md     # 探索过程记录
-│   └── known-issues.md        # 已知问题和解决方案
-├── scripts/
-│   ├── list_targets.js        # 列出 CDP targets
-│   ├── send_message.js        # 发送消息到 Agent（主脚本）
-│   └── read_sessions.js       # 读取会话列表
-├── archive/                   # 过程文件备份
-│   ├── scripts/               # 早期探索脚本
-│   └── logs/                  # 输出日志
-└── setup/
-    └── create_shortcut.ps1    # 创建 CDP 快捷方式
+│   ├── design-v2.md           # V2 设计文档
+│   ├── known-issues.md
+│   ├── cdp-architecture.md
+│   ├── ipc-channels.md
+│   └── exploration-log.md
+├── templates/                 # 模板文件
+└── archive/                   # 历史备份
 ```
 
-## 参考文件位置
+## 关键约束
 
-| 文件 | 说明 |
-|------|------|
-| `A:\WorkBuddy\resources\app\out\codebuddy\main.js` | WorkBuddy 扩展主代码 |
-| `A:\WorkBuddy\resources\app\out\vs\base\parts\sandbox\electron-sandbox\preload.js` | Electron preload (IPC 实现) |
+1. **单前台会话** — WorkBuddy 同一时间只显示一个会话的消息，切换是排他的
+2. **消息在 React 内存中** — 无法 API 获取，只能 DOM 提取
+3. **CDP 连接可能断开** — VS Code 刷新 agentManager 时需要重连
+4. **消息总线是内存的** — 进程重启后清空
+
+## V1 文档
+
+V1 的 CDP 探索、IPC 通道调查、已知问题等详细文档保留在 `docs/` 目录。

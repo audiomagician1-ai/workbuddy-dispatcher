@@ -1,0 +1,17 @@
+{
+  "name": "workbuddy-dispatcher",
+  "version": "2.0.0",
+  "description": "WorkBuddy Agent orchestration system via CDP",
+  "main": "mcp_server.js",
+  "scripts": {
+    "start": "node mcp_server.js",
+    "start:port": "node mcp_server.js --port",
+    "test:session": "node scripts/read_messages.js --sessions",
+    "test:send": "node scripts/send_message.js",
+    "test:cdp": "node scripts/list_targets.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "ws": "^8.20.0"
+  }
+}

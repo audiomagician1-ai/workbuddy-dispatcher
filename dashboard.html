@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WorkBuddy Dispatcher V2</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; }
+    .header { background: #16213e; padding: 16px 24px; border-bottom: 1px solid #0f3460; }
+    .header h1 { font-size: 18px; color: #e94560; }
+    .header .subtitle { font-size: 12px; color: #888; margin-top: 2px; }
+    .stats { display: flex; gap: 16px; padding: 16px 24px; flex-wrap: wrap; }
+    .stat-card { background: #16213e; border-radius: 8px; padding: 16px 24px; min-width: 140px; border: 1px solid #0f3460; }
+    .stat-card .label { font-size: 11px; color: #888; text-transform: uppercase; }
+    .stat-card .value { font-size: 28px; font-weight: bold; margin-top: 4px; }
+    .stat-card .value.running { color: #00d2ff; }
+    .stat-card .value.total { color: #e94560; }
+    .stat-card .value.active { color: #00ff88; }
+    .stat-card .value.warning { color: #ffaa00; }
+    .section { padding: 16px 24px; }
+    .section h2 { font-size: 14px; color: #e94560; margin-bottom: 12px; border-bottom: 1px solid #0f3460; padding-bottom: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; padding: 8px 12px; background: #16213e; color: #888; font-weight: 500; }
+    td { padding: 8px 12px; border-bottom: 1px solid #1a1a2e; }
+    tr:hover { background: rgba(255,255,255,0.03); }
+    .status-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+    .status-badge.idle { background: #1a472a; color: #00ff88; }
+    .status-badge.working { background: #1a3a5c; color: #00d2ff; }
+    .status-badge.completed { background: #1a472a; color: #00ff88; }
+    .status-badge.failed { background: #4a1a1a; color: #ff4444; }
+    .status-badge.running { background: #1a3a5c; color: #00d2ff; }
+    .status-badge.pending { background: #3a3a1a; color: #ffaa00; }
+    .refresh-bar { padding: 8px 24px; font-size: 11px; color: #555; display: flex; justify-content: space-between; }
+    button { background: #e94560; color: white; border: none; padding: 6px 16px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    button:hover { background: #ff6b81; }
+    .empty { color: #555; font-style: italic; padding: 16px; }
+    #error { color: #ff4444; padding: 8px 24px; display: none; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    .loading { animation: pulse 1.5s infinite; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>WorkBuddy Dispatcher V2</h1>
+    <div class="subtitle">Multi-Agent Orchestration via CDP</div>
+  </div>
+
+  <div id="error"></div>
+
+  <div class="stats" id="stats">
+    <div class="stat-card"><div class="label">Sessions</div><div class="value total" id="s-sessions">-</div></div>
+    <div class="stat-card"><div class="label">Active</div><div class="value active" id="s-active">-</div></div>
+    <div class="stat-card"><div class="label">Chains</div><div class="value running" id="s-chains">-</div></div>
+    <div class="stat-card"><div class="label">Tasks</div><div class="value warning" id="s-tasks">-</div></div>
+    <div class="stat-card"><div class="label">Channels</div><div class="value" id="s-channels">-</div></div>
+    <div class="stat-card"><div class="label">Features</div><div class="value" id="s-features">-</div></div>
+  </div>
+
+  <div class="refresh-bar">
+    <span id="last-refresh">Not yet refreshed</span>
+    <button onclick="refresh()">Refresh (R)</button>
+  </div>
+
+  <div class="section">
+    <h2>Sessions</h2>
+    <table><thead><tr><th>Active</th><th>Title</th><th>Status</th><th>CWD</th><th>Updated</th></tr></thead>
+    <tbody id="sessions-body"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody></table>
+  </div>
+
+  <div class="section">
+    <h2>Task Chains & Tasks</h2>
+    <table><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Progress</th><th>Created</th></tr></thead>
+    <tbody id="tasks-body"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody></table>
+  </div>
+
+  <div class="section">
+    <h2>Channels</h2>
+    <table><thead><tr><th>Channel</th><th>Messages</th><th>Last Activity</th></tr></thead>
+    <tbody id="channels-body"><tr><td colspan="3" class="empty">Loading...</td></tr></tbody></table>
+  </div>
+
+  <script>
+    const API = '';
+    let autoRefresh = true;
+
+    async function fetchJSON(path) {
+      const res = await fetch(API + path);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    }
+
+    async function refresh() {
+      try {
+        document.getElementById('error').style.display = 'none';
+        const [overview, sessions, tasks, channels, features] = await Promise.all([
+          fetchJSON('/api/overview'),
+          fetchJSON('/api/sessions'),
+          fetchJSON('/api/tasks'),
+          fetchJSON('/api/channels'),
+          fetchJSON('/api/features')
+        ]);
+
+        // Stats
+        document.getElementById('s-sessions').textContent = overview.sessions.total;
+        document.getElementById('s-active').textContent = overview.sessions.active;
+        document.getElementById('s-chains').textContent = overview.tasks.chains;
+        document.getElementById('s-tasks').textContent = overview.tasks.tasks;
+        document.getElementById('s-channels').textContent = overview.channels.channelCount || 0;
+        const fDone = features.done || 0;
+        const fTotal = features.total || 0;
+        document.getElementById('s-features').textContent = fTotal ? `${fDone}/${fTotal}` : '-';
+
+        // Sessions
+        const sb = document.getElementById('sessions-body');
+        if (sessions.length === 0) {
+          sb.innerHTML = '<tr><td colspan="5" class="empty">No sessions</td></tr>';
+        } else {
+          sb.innerHTML = sessions.map(s => `
+            <tr>
+              <td>${s.active ? '🟢' : ''}</td>
+              <td title="${s.conversationId}">${s.title || '(untitled)'}</td>
+              <td><span class="status-badge ${s.status?.toLowerCase() || 'unknown'}">${s.status || 'unknown'}</span></td>
+              <td style="font-size:11px;color:#888">${s.cwd ? s.cwd.split(/[\/\\]/).slice(-3).join('/') : '-'}</td>
+              <td style="font-size:11px;color:#888">${s.updatedAt ? new Date(s.updatedAt).toLocaleString() : '-'}</td>
+            </tr>
+          `).join('');
+        }
+
+        // Tasks
+        const tb = document.getElementById('tasks-body');
+        const allTasks = [
+          ...(tasks.chains || []).map(c => ({ ...c, type: 'chain', progress: `${c.currentStep}/${c.totalSteps}` })),
+          ...(tasks.tasks || []).map(t => ({ ...t, type: t.type || 'task', progress: t.type === 'loop' ? `Round ${t.currentRound}/${t.maxRounds}` : `${t.runs} runs` }))
+        ];
+        if (allTasks.length === 0) {
+          tb.innerHTML = '<tr><td colspan="5" class="empty">No tasks</td></tr>';
+        } else {
+          tb.innerHTML = allTasks.map(t => `
+            <tr>
+              <td>${t.name}</td>
+              <td>${t.type}</td>
+              <td><span class="status-badge ${t.status}">${t.status}</span></td>
+              <td>${t.progress || '-'}</td>
+              <td style="font-size:11px;color:#888">${t.createdAt ? new Date(t.createdAt).toLocaleString() : '-'}</td>
+            </tr>
+          `).join('');
+        }
+
+        // Channels
+        const cb = document.getElementById('channels-body');
+        const chList = channels || [];
+        if (chList.length === 0) {
+          cb.innerHTML = '<tr><td colspan="3" class="empty">No channels</td></tr>';
+        } else {
+          cb.innerHTML = chList.map(c => `
+            <tr>
+              <td>${c.name}</td>
+              <td>${c.count}</td>
+              <td style="font-size:11px;color:#888">${c.lastTimestamp ? new Date(c.lastTimestamp).toLocaleString() : '-'}</td>
+            </tr>
+          `).join('');
+        }
+
+        document.getElementById('last-refresh').textContent = `Last: ${new Date().toLocaleTimeString()}`;
+      } catch (err) {
+        document.getElementById('error').textContent = 'Error: ' + err.message;
+        document.getElementById('error').style.display = 'block';
+      }
+    }
+
+    document.addEventListener('keydown', e => { if (e.key === 'r' || e.key === 'R') refresh(); });
+    setInterval(refresh, 15000);
+    refresh();
+  </script>
+</body>
+</html>
